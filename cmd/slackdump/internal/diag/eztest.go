@@ -1,0 +1,181 @@
+// Copyright (c) 2021-2026 Rustam Gilyazov and Contributors.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package diag
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+
+	"github.com/playwright-community/playwright-go"
+
+	"github.com/rusq/slack"
+	"github.com/rusq/slackdump/v4/auth"
+	"github.com/rusq/slackdump/v4/cmd/slackdump/internal/cfg"
+	"github.com/rusq/slackdump/v4/cmd/slackdump/internal/golang/base"
+)
+
+var cmdEzTest = &base.Command{
+	Run:       runEzLoginTest,
+	UsageLine: "slack tools eztest",
+	Short:     "EZ-Login 3000 test",
+	Long: `
+# EZ-Login 3000 Test tool
+Eztest attempts to start EZ Login 3000 on the device.
+
+The browser will open, and you will be offered to login to the workspace of your
+choice.  On successful login it outputs the json with the test results.
+
+You will see "OK" in the end if there were no issues, otherwise an error will
+be printed and the test will be terminated.
+`,
+	CustomFlags: true,
+	PrintFlags:  true,
+}
+
+type ezResult struct {
+	Engine      string                  `json:"engine,omitempty"`
+	HasToken    bool                    `json:"has_token,omitempty"`
+	HasCookies  bool                    `json:"has_cookies,omitempty"`
+	Err         *string                 `json:"error,omitempty"`
+	Credentials *Credentials            `json:"credentials,omitempty"`
+	Response    *slack.AuthTestResponse `json:"response,omitempty"`
+}
+
+type Credentials struct {
+	Token   string         `json:"token,omitempty"`
+	Cookies []*http.Cookie `json:"cookie,omitempty"`
+}
+
+type eztestOpts struct {
+	printCreds bool
+	wsp        string
+	legacy     bool
+}
+
+var eztestFlags eztestOpts
+
+func init() {
+	cmdEzTest.Flag.Usage = func() {
+		fmt.Fprint(os.Stdout, "usage: slackdump tools eztest [flags]\n\nFlags:\n")
+		cmdEzTest.Flag.PrintDefaults()
+	}
+	cmdEzTest.Flag.BoolVar(&eztestFlags.printCreds, "p", false, "print credentials")
+	cmdEzTest.Flag.BoolVar(&eztestFlags.legacy, "legacy-browser", false, "run with playwright")
+	cmdEzTest.Flag.StringVar(&eztestFlags.wsp, "w", "", "Slack `workspace` to login to.")
+}
+
+func runEzLoginTest(ctx context.Context, cmd *base.Command, args []string) error {
+	lg := cfg.Log
+
+	if err := cmd.Flag.Parse(args); err != nil {
+		base.SetExitStatus(base.SInvalidParameters)
+		return err
+	}
+
+	if eztestFlags.wsp == "" {
+		base.SetExitStatus(base.SInvalidParameters)
+		cmd.Flag.Usage()
+		return nil
+	}
+
+	var (
+		res ezResult
+	)
+
+	if eztestFlags.legacy {
+		res = tryPlaywrightAuth(ctx, eztestFlags.wsp, eztestFlags.printCreds)
+	} else {
+		res = tryRodAuth(ctx, eztestFlags.wsp, eztestFlags.printCreds)
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(res); err != nil {
+		base.SetExitStatus(base.SApplicationError)
+		return err
+	}
+	if res.Err == nil {
+		lg.Info("OK")
+	} else {
+		lg.Error("ERROR", "error", *res.Err)
+		base.SetExitStatus(base.SApplicationError)
+		return errors.New(*res.Err)
+	}
+	return nil
+}
+
+func tryPlaywrightAuth(ctx context.Context, wsp string, populateCreds bool) ezResult {
+	var ret = ezResult{Engine: "playwright"}
+
+	if err := playwright.Install(&playwright.RunOptions{Browsers: []string{"firefox"}}); err != nil {
+		ret.Err = new(fmt.Sprintf("playwright installation error: %s", err))
+		return ret
+	}
+
+	prov, err := auth.NewPlaywrightAuth(ctx, auth.BrowserWithWorkspace(wsp))
+	if err != nil {
+		ret.Err = new(err.Error())
+		return ret
+	}
+
+	ret.HasToken = len(prov.SlackToken()) > 0
+	ret.HasCookies = len(prov.Cookies()) > 0
+	if populateCreds {
+		ret.Credentials = &Credentials{
+			Token:   prov.SlackToken(),
+			Cookies: prov.Cookies(),
+		}
+		resp, err := prov.Test(ctx)
+		if err != nil {
+			ret.Err = new(err.Error())
+			return ret
+		}
+		ret.Response = resp
+	}
+	return ret
+}
+
+//go:fix inline
+func ptr[T any](t T) *T { return new(t) }
+
+func tryRodAuth(ctx context.Context, wsp string, populateCreds bool) ezResult {
+	ret := ezResult{Engine: "rod"}
+	prov, err := auth.NewRODAuth(ctx, auth.BrowserWithWorkspace(wsp))
+	if err != nil {
+		ret.Err = new(err.Error())
+		return ret
+	}
+
+	ret.HasCookies = len(prov.Cookies()) > 0
+	ret.HasToken = len(prov.SlackToken()) > 0
+	if populateCreds {
+		ret.Credentials = &Credentials{
+			Token:   prov.SlackToken(),
+			Cookies: prov.Cookies(),
+		}
+		resp, err := prov.Test(ctx)
+		if err != nil {
+			ret.Err = new(err.Error())
+			return ret
+		}
+		ret.Response = resp
+	}
+	return ret
+}

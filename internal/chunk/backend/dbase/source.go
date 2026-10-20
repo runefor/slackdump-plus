@@ -1,0 +1,468 @@
+// Copyright (c) 2021-2026 Rustam Gilyazov and Contributors.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package dbase
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"iter"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"runtime/trace"
+	"time"
+
+	"github.com/rusq/slackdump/v4/internal/chunk/backend/dbase/repository"
+
+	"github.com/jmoiron/sqlx"
+
+	"github.com/rusq/slack"
+
+	"github.com/rusq/slackdump/v4/internal/chunk"
+	"github.com/rusq/slackdump/v4/internal/fasttime"
+	"github.com/rusq/slackdump/v4/internal/structures"
+)
+
+const preallocSz = 100 // preallocate slice size
+
+// DefaultDBFile is the default database filename used when a directory
+// is passed instead of a file path.
+const DefaultDBFile = "slackdump.sqlite"
+
+type Source struct {
+	conn *sqlx.DB
+	// canClose set to false when the connection is passed to the source
+	// and should not be closed by the source.
+	canClose bool
+}
+
+// ErrIsDirectory is returned when a directory path is passed instead of
+// a database file.
+var ErrIsDirectory = fmt.Errorf("path is a directory")
+
+// validateDBPath checks if path is a directory and returns a helpful error
+// with a suggestion if the expected database file exists inside.
+func validateDBPath(path string) error {
+	// Check if path is a symlink and warn about it.
+	li, err := os.Lstat(path)
+	if err != nil && !os.IsNotExist(err) {
+		slog.Warn("failed to stat path, continuing", "path", path, "error", err)
+	} else if err == nil && li.Mode()&os.ModeSymlink != 0 {
+		slog.Warn("database path is a symlink, following it to the target", "path", path)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Non-existent paths are allowed (for creating new databases).
+			return nil
+		}
+		return fmt.Errorf("stat: %w", err)
+	}
+	if fi.IsDir() {
+		dbFile := filepath.Join(path, DefaultDBFile)
+		if _, err := os.Stat(dbFile); err == nil {
+			return fmt.Errorf("%w: %s (did you mean %q?)", ErrIsDirectory, path, dbFile)
+		}
+		return fmt.Errorf("%w: %s (no %s found inside)", ErrIsDirectory, path, DefaultDBFile)
+	}
+	return nil
+}
+
+// Open attempts to open the database at given path for reading.
+func Open(ctx context.Context, path string) (*Source, error) {
+	if err := validateDBPath(path); err != nil {
+		return nil, err
+	}
+	// migrate to the latest
+	if err := migrate(ctx, path); err != nil {
+		return nil, err
+	}
+	conn, err := sqlx.Open(repository.Driver, "file:"+path+"?mode=ro")
+	if err != nil {
+		return nil, err
+	}
+	if err := conn.PingContext(ctx); err != nil {
+		return nil, err
+	}
+	return &Source{conn: conn, canClose: true}, nil
+}
+
+// OpenRW attempts to open the database at given path for reading and writing.
+// Use [Open] when only read access is needed.
+func OpenRW(ctx context.Context, path string) (*RWSource, error) {
+	if err := validateDBPath(path); err != nil {
+		return nil, err
+	}
+	if err := migrate(ctx, path); err != nil {
+		return nil, err
+	}
+	conn, err := sqlx.Open(repository.Driver, "file:"+path+"?mode=rw")
+	if err != nil {
+		return nil, err
+	}
+	if err := conn.PingContext(ctx); err != nil {
+		return nil, err
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("enable foreign keys: %w", err)
+	}
+	return &RWSource{Source: &Source{conn: conn, canClose: true}}, nil
+}
+
+// RWSource wraps [Source] with alias write operations.  It satisfies the
+// viewer Aliaser interface together with the read methods promoted from
+// the embedded [Source].
+type RWSource struct {
+	*Source
+}
+
+func (s *RWSource) SetAlias(id, alias string) error {
+	ar := repository.NewAliasRepository()
+	return ar.Set(context.Background(), s.conn, id, alias)
+}
+
+func (s *RWSource) DeleteAlias(id string) error {
+	ar := repository.NewAliasRepository()
+	return ar.Delete(context.Background(), s.conn, id)
+}
+
+func migrate(ctx context.Context, path string) error {
+	conn, err := sql.Open(repository.Driver, path)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := repository.Migrate(ctx, conn, false); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA wal_checkpoint"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Close closes the database connection.  It is a noop
+// if the [Source] was created with [Connect].
+func (s *Source) Close() error {
+	if !s.canClose {
+		slog.Debug("not closing database connection, it was passed to the source")
+		return nil
+	}
+	slog.Debug("closing database connection")
+	if err := s.conn.Close(); err != nil {
+		slog.Error("error closing database connection", "error", err)
+		return err
+	}
+	return nil
+}
+
+// Channels returns all channels.  If the channel info is not available,
+// it will attempt to get all channels.
+func (s *Source) Channels(ctx context.Context) ([]slack.Channel, error) {
+	cr := repository.NewChannelRepository()
+	it, err := cr.AllOfType(ctx, s.conn, chunk.CChannelInfo)
+	if err != nil {
+		return nil, err
+	}
+	var chns []slack.Channel
+	chns, err = collect(it, preallocSz)
+	if err != nil {
+		return nil, err
+	}
+	if len(chns) == 0 {
+		// no channel info, try getting all channels
+		it, err := cr.AllOfType(ctx, s.conn, chunk.CChannels)
+		if err != nil {
+			return nil, err
+		}
+		chns, err = collect(it, preallocSz)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Use index-based iteration: range-value loop copies the struct,
+	// so assigning Members to the copy would be silently discarded.
+	for i := range chns {
+		users, err := s.channelUsers(ctx, chns[i].ID, chns[i].NumMembers)
+		if err != nil {
+			return nil, err
+		}
+		chns[i].Members = users
+	}
+
+	return chns, nil
+}
+
+func (s *Source) channelUsers(ctx context.Context, channelID string, prealloc int) ([]string, error) {
+	cur := repository.NewChannelUserRepository()
+	users, err := cur.GetByChannelID(ctx, s.conn, channelID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	us := make([]string, 0, prealloc)
+	for c, err := range users {
+		if err != nil {
+			return nil, err
+		}
+		us = append(us, c.UserID)
+	}
+	return us, nil
+}
+
+func (s *Source) Users(ctx context.Context) ([]slack.User, error) {
+	ur := repository.NewUserRepository()
+
+	it, err := ur.AllOfType(ctx, s.conn, chunk.CUsers)
+	if err != nil {
+		return nil, err
+	}
+	return collect(it, preallocSz)
+}
+
+type valuer[T any] interface {
+	Val() (T, error)
+}
+
+func valueIter[T any, D valuer[T]](it iter.Seq2[D, error]) iter.Seq2[T, error] {
+	iterFn := func(yield func(T, error) bool) {
+		for c, err := range it {
+			if err != nil {
+				var t T
+				yield(t, err)
+				return
+			}
+			if !yield(c.Val()) {
+				return
+			}
+		}
+	}
+	return iterFn
+}
+
+func collect[T any, D valuer[T]](it iter.Seq2[D, error], sz int) ([]T, error) {
+	vs := make([]T, 0, sz)
+	for c, err := range it {
+		if err != nil {
+			return nil, err
+		}
+		v, err := c.Val()
+		if err != nil {
+			return nil, err
+		}
+		vs = append(vs, v)
+	}
+	return vs, nil
+}
+
+func (s *Source) AllMessages(ctx context.Context, channelID string) (iter.Seq2[slack.Message, error], error) {
+	mr := repository.NewMessageRepository()
+	it, err := mr.AllForID(ctx, s.conn, channelID)
+	if err != nil {
+		return nil, err
+	}
+	return valueIter(it), nil
+}
+
+func (s *Source) AllThreadMessages(ctx context.Context, channelID, threadID string) (iter.Seq2[slack.Message, error], error) {
+	mr := repository.NewMessageRepository()
+	it, err := mr.AllForThread(ctx, s.conn, channelID, threadID)
+	if err != nil {
+		return nil, err
+	}
+	return valueIter(it), nil
+}
+
+// CanvasMessages returns archived canvas discussion roots for a hidden canvas channel.
+func (s *Source) CanvasMessages(ctx context.Context, hiddenChannelID string) (iter.Seq2[slack.Message, error], error) {
+	it, err := repository.NewMessageRepository().AllCanvasMessages(ctx, s.conn, hiddenChannelID)
+	if err != nil {
+		return nil, err
+	}
+	return valueIter(it), nil
+}
+
+// CanvasThreadMessages returns the root and replies for one canvas discussion.
+func (s *Source) CanvasThreadMessages(ctx context.Context, hiddenChannelID, threadTS string) (iter.Seq2[slack.Message, error], error) {
+	it, err := repository.NewMessageRepository().AllForCanvasThread(ctx, s.conn, hiddenChannelID, threadTS)
+	if err != nil {
+		return nil, err
+	}
+	return valueIter(it), nil
+}
+
+func (s *Source) Sorted(ctx context.Context, channelID string, desc bool, cb func(ts time.Time, msg *slack.Message) error) error {
+	mr := repository.NewMessageRepository()
+	it, err := mr.Sorted(ctx, s.conn, channelID, repository.Asc)
+	if err != nil {
+		return err
+	}
+	for c, err := range it {
+		if err != nil {
+			return err
+		}
+		v, err := c.Val()
+		if err != nil {
+			return err
+		}
+		if err := cb(fasttime.Int2Time(c.ID), &v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Source) ChannelInfo(ctx context.Context, channelID string) (*slack.Channel, error) {
+	cr := repository.NewChannelRepository()
+	c, err := cr.Get(ctx, s.conn, channelID)
+	if err != nil {
+		return nil, err
+	}
+	v, err := c.Val()
+	if err != nil {
+		return nil, err
+	}
+	users, err := s.channelUsers(ctx, v.ID, v.NumMembers)
+	if err != nil {
+		return nil, err
+	}
+	v.Members = users
+
+	return &v, nil
+}
+
+func (s *Source) WorkspaceInfo(ctx context.Context) (*slack.AuthTestResponse, error) {
+	cr := repository.NewWorkspaceRepository()
+	dbw, err := cr.GetWorkspace(ctx, s.conn)
+	if err != nil {
+		return nil, err
+	}
+	w, err := dbw.Val()
+	return &w, err
+}
+
+func (s *Source) Alias(id string) (string, bool, error) {
+	ar := repository.NewAliasRepository()
+	a, err := ar.Get(context.Background(), s.conn, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return a.Alias, true, nil
+}
+
+func (s *Source) Aliases() (map[string]string, error) {
+	ar := repository.NewAliasRepository()
+	aa, err := ar.All(context.Background(), s.conn)
+	if err != nil {
+		return nil, err
+	}
+	mm := make(map[string]string, len(aa))
+	for _, a := range aa {
+		mm[a.ChannelID] = a.Alias
+	}
+	return mm, nil
+}
+
+func (s *Source) Latest(ctx context.Context) (map[structures.SlackLink]time.Time, error) {
+	ctx, task := trace.NewTask(ctx, "Latest")
+	defer task.End()
+
+	r := repository.NewMessageRepository()
+	m := make(map[structures.SlackLink]time.Time, preallocSz)
+	slog.DebugContext(ctx, "fetching latest messages")
+	itm, err := r.LatestMessages(ctx, s.conn)
+	if err != nil {
+		return nil, err
+	}
+	for c, err := range itm {
+		if err != nil {
+			return nil, err
+		}
+		sl := structures.SlackLink{
+			Channel: c.ChannelID,
+		}
+		m[sl] = fasttime.Int2Time(c.ID)
+	}
+	slog.DebugContext(ctx, "fetching latest threads")
+	ittm, err := r.LatestThreads(ctx, s.conn)
+	if err != nil {
+		return nil, err
+	}
+	for c, err := range ittm {
+		if err != nil {
+			return nil, err
+		}
+		sl := structures.SlackLink{
+			Channel:  c.ChannelID,
+			ThreadTS: c.ThreadTS,
+		}
+		m[sl] = fasttime.Int2Time(c.ID)
+	}
+	return m, nil
+}
+
+func (src *Source) ToChunk(ctx context.Context, e chunk.Encoder, sessID int64) error {
+	if sessID < 1 {
+		return ErrInvalidSessionID
+	}
+	sr := repository.NewSessionRepository()
+	sess, err := sr.Get(ctx, src.conn, sessID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrInvalidSessionID
+		}
+		return err
+	}
+	if !sess.Finished {
+		return ErrIncomplete
+	}
+
+	cr := repository.NewChunkRepository()
+	it, err := cr.All(ctx, src.conn, sessID)
+	if err != nil {
+		return err
+	}
+	for dbchunk, err := range it {
+		if err != nil {
+			return err
+		}
+		fn, ok := assemblers[dbchunk.TypeID]
+		if !ok {
+			return chunk.ErrUnsupChunkType
+		}
+		chunk, err := fn(ctx, src.conn, &dbchunk)
+		if err != nil {
+			return err
+		}
+		if err := e.Encode(ctx, chunk); err != nil {
+			return fmt.Errorf("error converting chunk %d[%s]: %w", dbchunk.ID, dbchunk.TypeID, err)
+		}
+	}
+	return nil
+}
+
+func (src *Source) Sessions(ctx context.Context) ([]repository.Session, error) {
+	sr := repository.NewSessionRepository()
+	return sr.All(ctx, src.conn)
+}

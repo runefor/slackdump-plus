@@ -1,0 +1,27 @@
+<blockquote class="slack-attachment">
+    <article>
+        {{ if .Text }}
+        <header>
+            <p class="author"><img class="icon" src="{{rewriteurl .AuthorIcon}}">{{ .AuthorName }} <span
+                    class="author-subname sm grey">{{
+                    .AuthorSubname}}</span></p>
+        </header>
+        <p>{{ .Text }}</p>
+        <footer>
+            <p class="footer grey small">
+                <img class="icon" src="{{rewriteurl .FooterIcon}}" alt="{{.ServiceName}}">{{ .Footer }}
+                {{- if .Ts }} | <time>{{ epoch .Ts }}</time>{{ end -}}
+            </p>
+        </footer>
+        {{ if .ImageURL }}
+        {{ template "attachment-image" . }}
+        {{ end }}
+        {{ else }}
+        {{ template "attachment-image" . }}
+        {{ end }}
+    </article>
+</blockquote>
+
+{{ define "attachment-image" }}
+<a href="{{rewriteurl .ImageURL}}" target="blank"><img class="attachment-image" src="{{rewriteurl .ImageURL}}" alt="{{.Fallback}}"></a>
+{{ end }}

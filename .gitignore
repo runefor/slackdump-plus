@@ -1,0 +1,89 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.zip
+__debug_bin
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# IDE
+.idea
+.vscode
+.gonvim
+
+#OS junk
+.DS_Store
+
+# temporary files and the rest of the crap
+*.json
+*.yml
+*.yaml
+*.toml
+!cmd/slackdump/internal/mcp/assets/layouts/**/*.json
+!cmd/slackdump/internal/mcp/assets/layouts/**/*.toml
+json/*
+examples/*
+experiments/*
+dist/*
+secrets.*
+cmd/slackdump/slackdump
+cmd/sdconv/sdconv
+/slackdump
+/*.txt
+*~
+*.swp
+.env
+*.cache
+*.log
+
+# goreleaser stuff
+dist/
+!.goreleaser.yaml
+!schema.json
+*.jsonl
+*.state
+
+# sundry junk used for testing and other fuckery
+/tmp
+*.dot
+
+# outputs
+slackdump_2*
+*.pdf
+*.ps
+*.html
+\#*\#
+__debug_bin*
+debug.test*
+!internal/viewer/templates/*.html
+!internal/viewer/renderer/templates/*.html
+!internal/fixtures/**/*.json
+*.sqlite*
+*.db
+# profiler files
+*.pprof
+*.prof
+*.pf
+
+.mcp.json
+*.har
+*.jsonl
+
+# Custom full-backup & rescue output directories
+slack_backup/
+*-backup/
+*_backup/
+__uploads/
+__avatars/
+__emojis/
+__plus/
+

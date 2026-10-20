@@ -1,0 +1,472 @@
+// Copyright (c) 2021-2026 Rustam Gilyazov and Contributors.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+// Package edge provides a limited implementation of undocumented Slack Edge
+// API necessary to get the data from a slack workspace.
+//
+// It handles rate limit retries internally (but only once).
+package edge
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"runtime/trace"
+	"strconv"
+	"time"
+
+	"github.com/rusq/chttp/v2"
+	"github.com/rusq/slack"
+	"github.com/rusq/slackauth"
+	"github.com/rusq/tagops"
+
+	"github.com/rusq/slackdump/v4/auth"
+	"github.com/rusq/slackdump/v4/internal/network"
+)
+
+type Client struct {
+	// cl is the http client to use
+	cl *http.Client
+	// edgeAPI is the edge API endpoint
+	edgeAPI string
+	// webclientAPI is the webclient APIs endpoint
+	webclientAPI string
+	// token is the slack token
+	token string
+
+	// teamID is the team ID
+	teamID string
+	tape   io.WriteCloser
+}
+
+const (
+	// integer boolean values used in forms
+	iFalse = iota
+	iTrue
+)
+
+type Option func(*Client)
+
+func WithTape(tape io.WriteCloser) Option {
+	return func(cl *Client) {
+		cl.tape = tape
+	}
+}
+
+var (
+	ErrNoTeamID = errors.New("teamID is empty")
+	ErrNoToken  = errors.New("token is empty")
+)
+
+func NewWithClient(workspaceName string, teamID string, token string, cl *http.Client, opt ...Option) (*Client, error) {
+	if teamID == "" {
+		return nil, ErrNoTeamID
+	}
+	if token == "" {
+		return nil, ErrNoToken
+	}
+	c := &Client{
+		cl:           cl,
+		token:        token,
+		teamID:       teamID,
+		webclientAPI: fmt.Sprintf("https://%s.slack.com/api/", workspaceName),
+		edgeAPI:      fmt.Sprintf("https://edgeapi.slack.com/cache/%s/", teamID),
+		tape:         nopTape{},
+	}
+	for _, o := range opt {
+		o(c)
+	}
+	return c, nil
+}
+
+func NewWithToken(ctx context.Context, token string, cookies []*http.Cookie) (*Client, error) {
+	if token == "" {
+		return nil, ErrNoToken
+	}
+	prov, err := auth.NewValueCookiesAuth(token, cookies)
+	if err != nil {
+		return nil, err
+	}
+	return New(ctx, prov)
+}
+
+type nopTape struct{}
+
+func (nopTape) Write(p []byte) (n int, err error) {
+	return len(p), nil
+}
+
+func (nopTape) Close() error {
+	return nil
+}
+
+// NewWithInfo is the same as New, but doesn't call the AuthTest on
+// initialisation.  Caller must ensure that the token is valid.
+func NewWithInfo(info *slack.AuthTestResponse, prov auth.Provider, opt ...Option) (*Client, error) {
+	hcl, err := prov.HTTPClient()
+	if err != nil {
+		return nil, err
+	}
+	c := &Client{
+		cl:           hcl,
+		token:        prov.SlackToken(),
+		teamID:       info.TeamID,
+		webclientAPI: info.URL + "api/",
+		edgeAPI:      fmt.Sprintf("https://edgeapi.slack.com/cache/%s/", info.TeamID),
+		tape:         nopTape{},
+	}
+
+	for _, o := range opt {
+		o(c)
+	}
+	return c, nil
+}
+
+func New(ctx context.Context, prov auth.Provider, opt ...Option) (*Client, error) {
+	info, err := prov.Test(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return NewWithInfo(info, prov, opt...)
+}
+
+func (cl *Client) Raw() *http.Client {
+	return cl.cl
+}
+
+func (cl *Client) Close() error {
+	var err error
+	if cl.tape != nil {
+		err = errors.Join(err, cl.tape.Close())
+	}
+	if cl.cl != nil {
+		err = errors.Join(err, chttp.Close(cl.cl))
+	}
+	return err
+}
+
+type BaseRequest struct {
+	Token string `json:"token"`
+}
+
+type baseResponse struct {
+	Ok               bool             `json:"ok"`
+	Error            string           `json:"error,omitempty"`
+	ResponseMetadata ResponseMetadata `json:"response_metadata"`
+}
+
+func (r baseResponse) validate(ep string) error {
+	if !r.Ok {
+		return &APIError{Err: r.Error, Metadata: r.ResponseMetadata, Endpoint: ep}
+	}
+	return nil
+}
+
+type ResponseMetadata struct {
+	Messages   []string `json:"messages,omitempty"`
+	NextCursor string   `json:"next_cursor,omitempty"`
+}
+
+func (r *BaseRequest) SetToken(token string) {
+	r.Token = token
+}
+
+func (r *BaseRequest) IsTokenSet() bool {
+	return len(r.Token) > 0
+}
+
+type PostRequest interface {
+	SetToken(string)
+	IsTokenSet() bool
+}
+
+const (
+	hdrContentType = "Content-Type"
+)
+
+// PostJSON posts a request to the edge API.  The request is marshalled to
+// JSON and the response is unmarshalled to the req, which must be a pointer
+// to a struct.
+func (cl *Client) PostJSON(ctx context.Context, path string, req PostRequest) (*http.Response, error) {
+	if !req.IsTokenSet() {
+		req.SetToken(cl.token)
+	}
+	data, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	return cl.do(ctx, cl.edgeAPI+path, "application/json", data)
+}
+
+// callEdgeAPI calls the edge API.
+func (cl *Client) callEdgeAPI(ctx context.Context, v any, endpoint string, req PostRequest) error {
+	r, err := cl.PostJSON(ctx, endpoint, req)
+	if err != nil {
+		return err
+	}
+	return cl.ParseResponse(v, r)
+}
+
+// Post sends a POST request to a webclient API, it marshals the form
+// values to url.Values, omitting empty fields, and sends the request.
+func (cl *Client) Post(ctx context.Context, path string, a any) (*http.Response, error) {
+	return cl.PostFormRaw(ctx, cl.webclientAPI+path, values(a, true))
+}
+
+// PostForm sends a POST request to a webclient API with form values.
+func (cl *Client) PostForm(ctx context.Context, path string, form url.Values) (*http.Response, error) {
+	return cl.PostFormRaw(ctx, cl.webclientAPI+path, form)
+}
+
+func (cl *Client) record(b []byte) {
+	if cl.tape != nil {
+		if _, err := cl.tape.Write(b); err != nil {
+			slog.Default().Error("error writing to tape", "error", err)
+		}
+	}
+}
+
+func (cl *Client) PostFormRaw(ctx context.Context, url string, form url.Values) (*http.Response, error) {
+	if form["token"] == nil {
+		form.Set("token", cl.token)
+	}
+	return cl.do(ctx, url, "application/x-www-form-urlencoded", []byte(form.Encode()))
+}
+
+func (cl *Client) ParseResponse(req any, r *http.Response) error {
+	if r.StatusCode < http.StatusOK || http.StatusMultipleChoices <= r.StatusCode {
+		return fmt.Errorf("error:  status code: %s", r.Status)
+	}
+	defer r.Body.Close()
+	dec := json.NewDecoder(cl.recorder(r.Body))
+	if err := dec.Decode(req); err != nil {
+		return err
+	}
+	return nil
+}
+
+const (
+	// defRetryAfter is the delay used when Slack rate limits a request
+	// without sending a valid Retry-After header.
+	defRetryAfter = 5 * time.Second
+	// maxRetryAfter is the longest Retry-After delay that is accepted as
+	// valid, longer values are treated as malformed.
+	maxRetryAfter = 1 * time.Hour
+	// maxDrain is the maximum number of bytes of the rate limited response
+	// body that are discarded to allow the connection reuse.
+	maxDrain = 64 << 10
+)
+
+// tapeSep separates the request and response records on the tape.
+var tapeSep = []byte("\n\n")
+
+// do sends a POST request with the given body to url, handling rate limiting
+// (see roundTrip), and records the body on the tape, if the request reached
+// the server.
+func (cl *Client) do(ctx context.Context, url string, contentType string, body []byte) (*http.Response, error) {
+	resp, err := cl.roundTrip(ctx, url, contentType, body)
+	if sent(err) {
+		cl.record(body)
+		cl.record(tapeSep)
+	}
+	return resp, err
+}
+
+// sent returns true if err, returned by roundTrip, means that the request
+// has reached the server.
+func sent(err error) bool {
+	var (
+		rle *slack.RateLimitedError
+		sce slack.StatusCodeError
+	)
+	return err == nil || errors.As(err, &rle) || errors.As(err, &sce)
+}
+
+// roundTrip sends a POST request with the given body to url, and handles rate
+// limiting.  It handles the rate limiting by waiting for the Retry-After only
+// once, if it receives another rate limit error, it returns
+// *slack.RateLimitedError to let the caller handle it.  Each attempt builds
+// the request from body, so that it never sends a drained body (see #746).
+func (cl *Client) roundTrip(ctx context.Context, url string, contentType string, body []byte) (*http.Response, error) {
+	const maxAttempts = 2
+	for attempt := 1; ; attempt++ {
+		req, err := newRequest(ctx, url, contentType, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		resp, err := cl.send(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			wait := retryAfter(ctx, resp)
+			drain(resp)
+			if attempt >= maxAttempts {
+				slog.DebugContext(ctx, "edge.do: still rate limited, giving up", "attempt", attempt, "delay", wait)
+				return nil, &slack.RateLimitedError{RetryAfter: wait}
+			}
+			slog.InfoContext(ctx, "got rate limited, waiting", "delay", wait)
+			if err := network.SleepCtx(ctx, wait); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if resp.StatusCode < http.StatusOK || http.StatusMultipleChoices <= resp.StatusCode {
+			respBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, slack.StatusCodeError{Code: resp.StatusCode, Status: string(respBody)}
+		}
+		return resp, nil
+	}
+}
+
+// newRequest creates a new POST request with the edge client headers set.
+func newRequest(ctx context.Context, url string, contentType string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set(hdrContentType, contentType)
+	req.Header.Set("Accept-Language", "en-NZ,en-AU;q=0.9,en;q=0.8")
+	req.Header.Set("User-Agent", slackauth.DefaultUserAgent)
+	return req, nil
+}
+
+func (cl *Client) send(ctx context.Context, req *http.Request) (*http.Response, error) {
+	defer trace.StartRegion(ctx, "edge.do").End()
+	return cl.cl.Do(req)
+}
+
+// drain discards up to maxDrain bytes of the response body and closes it, so
+// that the connection can be reused.
+func drain(resp *http.Response) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrain))
+	resp.Body.Close()
+}
+
+// retryAfter returns the delay from the Retry-After header of the rate
+// limited response, or defRetryAfter if the header is missing or invalid.
+func retryAfter(ctx context.Context, resp *http.Response) time.Duration {
+	wait, err := parseRetryAfter(resp)
+	if err != nil {
+		slog.WarnContext(ctx, "using default rate limit delay", "error", err, "delay", defRetryAfter)
+		return defRetryAfter
+	}
+	return wait
+}
+
+// parseRetryAfter parses the Retry-After header of the response, which can
+// be either a number of seconds or an HTTP date (RFC 9110, section 10.2.3).
+// Fractional seconds are accepted, delays above maxRetryAfter are rejected.
+func parseRetryAfter(resp *http.Response) (time.Duration, error) {
+	strWait := resp.Header.Get("Retry-After")
+	if strWait == "" {
+		return 0, errors.New("got rate limited, but did not get a Retry-After header")
+	}
+	var wait time.Duration
+	if secs, err := strconv.ParseFloat(strWait, 64); err == nil {
+		// the range check before the conversion guards against overflow,
+		// and rejects NaN.
+		if !(0 <= secs && secs <= maxRetryAfter.Seconds()) {
+			return 0, fmt.Errorf("Retry-After out of range: %q", strWait)
+		}
+		wait = time.Duration(secs * float64(time.Second))
+	} else {
+		t, err := http.ParseTime(strWait)
+		if err != nil {
+			return 0, fmt.Errorf("invalid Retry-After %q", strWait)
+		}
+		wait = max(time.Until(t), 0)
+		if wait > maxRetryAfter {
+			return 0, fmt.Errorf("Retry-After out of range: %q", strWait)
+		}
+	}
+	return wait, nil
+}
+
+// values returns url.Values from a struct.  If omitempty is true, then the
+// empty values are omitted for the fields that have the `omitempty` tag.
+func values(s any, omitempty bool) url.Values {
+	var v = make(url.Values)
+	m := tagops.ToMap(s, "json", omitempty, true)
+	for k, val := range m {
+		v.Set(k, fmt.Sprint(val))
+	}
+	return v
+}
+
+func (cl *Client) webapiURL(endpoint string) string {
+	return cl.webclientAPI + endpoint
+}
+
+type APIError struct {
+	Err      string
+	Metadata ResponseMetadata
+	Endpoint string
+}
+
+func (e *APIError) Error() string {
+	if len(e.Metadata.Messages) > 0 {
+		return e.Err + ": " + e.Metadata.Messages[0]
+	}
+	return e.Err
+}
+
+type WebClientFields struct {
+	XReason  string `json:"_x_reason,omitempty"`
+	XMode    string `json:"_x_mode,omitempty"`
+	XSonic   bool   `json:"_x_sonic"`
+	XAppName string `json:"_x_app_name"`
+}
+
+func webclientReason(reason string) WebClientFields {
+	return WebClientFields{
+		XReason:  reason,
+		XMode:    "online",
+		XSonic:   true,
+		XAppName: "client",
+	}
+}
+
+func (cl *Client) recorder(r io.Reader) io.Reader {
+	if cl.tape == nil {
+		return r
+	}
+	return io.TeeReader(r, cl.tape)
+}
+
+// Pagination contains the pagination information.  It is truly fucked, Slack
+// does not allow to seek past Page 100, when page > 100 requested, Slack
+// returns the first page (Page=1).  Seems to be an internal limitation.  The
+// workaround would be to use the Query parameter, to be more specific about
+// the channel names, but to get all channels, this would require iterating
+// through all 65536 runes of unicode give or take the special characters.
+//
+// For now, this doesn't work as a replacement for conversation.list (202403).
+type Pagination struct {
+	TotalCount int64  `json:"total_count"`
+	Page       int    `json:"page"`
+	PerPage    int    `json:"per_page"`
+	PageCount  int    `json:"page_count"`
+	First      int64  `json:"first"`
+	Last       int64  `json:"last"`
+	NextCursor string `json:"next_cursor,omitempty"`
+}

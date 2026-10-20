@@ -1,0 +1,114 @@
+# Contributors
+
+This file recognizes all the amazing people who have contributed to Slackdump. Thank you for making this project better!
+
+## Main Contributors
+
+### [@rusq](https://github.com/rusq) - Rustam Gilyazov
+Core maintainer and primary developer of Slackdump, responsible for the v3 rewrite, authentication system, export formats, CLI architecture, and the vast majority of features and bug fixes.
+
+### [@yarikoptic](https://github.com/yarikoptic) - Yaroslav Halchenko
+Added comprehensive code quality tools including codespell configuration and GitHub actions, improved shell scripts with shellcheck fixes, and enhanced overall code consistency.
+
+### [@marcuscreo](https://github.com/marcus-crane) - Marcus Crane
+Significantly improved the built-in viewer with static file serving, text wrapping on system messages, profile sidebar styling, file attachment improvements, and video/image display enhancements.
+
+### [@arran4](https://github.com/arran4) - Arran Ubels
+Enhanced the release pipeline with GoReleaser improvements, GitHub Actions version bumps, multiple output formats, and man page inclusion in releases.
+
+### [@OleksandrRedko](https://github.com/alexandear-org) - Oleksandr Redko
+Improved code quality by fixing typos across multiple files and filenames, simplifying format.All implementation, and replacing context.Background with t.Context in tests.
+
+### [@lbeckman314](https://github.com/lbeckman314) - Liam Beckman
+Fixed critical viewer handler bug by setting proper Content-Type headers for file downloads, enabling canvas and other file types to display correctly.
+
+### [@omarcostahamido](https://github.com/omarcostahamido) - Omar Costa Hamido
+Improved documentation by updating the export usage guide with clearer instructions and examples.
+
+### [@yuvipanda](https://github.com/yuvipanda) - Yuvi Panda
+Enhanced documentation by adding RST formatting fixes and documenting how to open developer tools for troubleshooting.
+
+### [@kolsys](https://github.com/kolsys)
+Implemented per-channel time range filtering by adding support for dump-from and dump-to parameters for individual channels.
+
+### [@volker-fr](https://github.com/volker-fr) - Volker
+Contributed numerous features and improvements: vacuum tool for database cleanup, file deduplication support, SQLite error handling improvements, channel user caching to reduce redundant API calls, thread optimization by skipping unnecessary user fetches, and dev experience improvements with Makefile documentation and additional tests.
+
+### [@icgma](https://github.com/icgma)
+Improved resume and backup workflows by adding resume-time entity deduplication, updating interactive login to prefer a system browser when Slack rejects bundled Chromium, and contributing the Replit + Google Drive backup recipe.
+
+## Individual Contributors
+
+### [@ChrisEdwards](https://github.com/ChrisEdwards) - Chris Edwards
+Fixed critical panics when threads have no replies in the specified time range or during text conversion.
+
+### [@errge](https://github.com/errge) - Gergely Risko
+Updated Dockerfile to use golang 1.21, keeping the Docker build environment current.
+
+### [@goretkin](https://github.com/goretkin) - Gustavo Nunes Goretkin
+Documented how to run Slackdump from a repository checkout, making it easier for developers to contribute.
+
+### [@jlmuir](https://github.com/jlmuir) - J. Lewis Muir
+Fixed a typo in README.md improving documentation clarity.
+
+### [@jhult](https://github.com/jhult) - Jonathan Hult
+Fixed the emoji-failfast flag functionality.
+
+### [@fitzyjoe](https://github.com/fitzyjoe) - Joseph Fitzgerald
+Added jq example to documentation for better data processing guidance.
+
+### [@robws](https://github.com/robws) - Rob
+Improved dump.sh shebang for better shell compatibility and updated README.rst documentation.
+
+### [@enterJazz](https://github.com/enterJazz) - Robert Schambach
+Improved dump.sh shebang for better portability across different systems.
+
+### [@rawlingsr](https://github.com/rawlingsr) - Ryan Rawlings
+Fixed a typo in README.md improving documentation quality.
+
+### [@ShlomoCode](https://github.com/ShlomoCode) - Shlomo
+Updated README.rst with documentation improvements.
+
+### [@YassineOsip](https://github.com/YassineOsip) - Yassine Lafkih
+Fixed snippet examples in documentation for better clarity.
+
+### [@eau-u4f](https://github.com/eau-u4f) - eau
+Contributed the Silent logger implementation for quieter operation modes.
+
+### [@snova-jamesv](https://github.com/snova-jamesv)
+Clarified the login step in quickstart.md to reduce user confusion during initial setup.
+
+### [@juzhiyuan](https://github.com/juzhiyuan) - Zhi Yuan Ju (琚致远)
+Fix incorrect instructions for the Sign On on Mobile.
+
+### [@shehrozsheikh](https://github.com/shehrozsheikh) - Shehroz Ahmed
+Fixed the viewer showing the wrong user name for DMs with a single conversation.
+
+### [@Fizmatik](https://github.com/Fizmatik) - Yuriy Tolpygo
+Fixed multiple bugs: range copy bug, DM member assignment, and SQLite variable limit exceeded error.
+
+### [@lzaldivarkt](https://github.com/lzaldivarkt) - Luis Zaldivar
+Fixed Edge client initialisation so it only uses Slack Edge APIs with `xoxc-` client tokens.
+
+### [@pR0Ps](https://github.com/pR0Ps) - Carey Metcalfe
+Added `slack-to-discord` to the Discord migration documentation.
+
+### [@chawlz7](https://github.com/chawlz7) - Charles Spellman
+Added stale thread and channel filtering flags for faster resume runs on long-lived archives.
+
+### [@ZimbiX](https://github.com/ZimbiX) - Brendan Weibrecht
+Corrected the QR-code login instructions so users can copy the image URL from Slack's current interface.
+
+### [@aerickson](https://github.com/aerickson) - Andrew Erickson
+Fixed channel timelines so refreshed thread parents remain visible after direct thread resume.
+
+### [@thomasmaerz](https://github.com/thomasmaerz)
+Fixed database dedupe joins for non-null keys, restoring fast dedupe previews on archives with many duplicate channel users.
+
+---
+
+**Total Contributors**: 33
+
+This list is sorted by number of contributions. Every contribution, no matter how small, helps make Slackdump better for everyone!
+
+If you'd like to contribute, please check out our [Code of Conduct](CODE_OF_CONDUCT.md) and submit a pull request.

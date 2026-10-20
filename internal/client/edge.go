@@ -1,0 +1,52 @@
+// Copyright (c) 2021-2026 Rustam Gilyazov and Contributors.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package client
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/rusq/chttp/v2"
+
+	"github.com/rusq/slackdump/v4/auth"
+	"github.com/rusq/slackdump/v4/internal/edge"
+)
+
+// NewEdge returns a new *Client that is guaranteed to have an edge (enterprise)
+// connection.  Use c.Edge() to obtain the underlying *edge.Client.
+func NewEdge(ctx context.Context, prov auth.Provider, opts ...Option) (*Client, error) {
+	if !auth.IsClientToken(prov.SlackToken()) {
+		return nil, fmt.Errorf("edge client requires a client token (xoxc-)")
+	}
+	hcl, scl, wi, err := newSlackClient(ctx, prov)
+	if err != nil {
+		return nil, err
+	}
+	// Edge and Slack clients intentionally use separate HTTP clients. The edge
+	// client dials provider.HTTPClient independently and owns its own transport.
+	ecl, err := edge.NewWithInfo(wi, prov)
+	if err != nil {
+		return nil, errors.Join(err, chttp.Close(hcl))
+	}
+	return &Client{
+		Client: scl,
+		edge:   ecl,
+		canvas: ecl,
+		wi:     wi,
+		hcl:    hcl,
+	}, nil
+}

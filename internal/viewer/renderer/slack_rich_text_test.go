@@ -1,0 +1,443 @@
+// Copyright (c) 2021-2026 Rustam Gilyazov and Contributors.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package renderer
+
+import (
+	"testing"
+
+	"github.com/rusq/slack"
+)
+
+func Test_rtseText(t *testing.T) {
+	type args struct {
+		ie slack.RichTextSectionElement
+	}
+	tests := []struct {
+		name    string
+		s       *Slack
+		args    args
+		want    string
+		want1   string
+		wantErr bool
+	}{
+		{
+			"valid text section",
+			&Slack{},
+			args{
+				ie: slack.RichTextSectionElement(slack.NewRichTextSectionTextElement("New Message", nil)),
+			},
+			"New Message",
+			"",
+			false,
+		},
+		{
+			"multiline",
+			&Slack{},
+			args{
+				ie: slack.RichTextSectionElement(slack.NewRichTextSectionTextElement("New\nMessage", nil)),
+			},
+			"New<br>Message",
+			"",
+			false,
+		},
+		{
+			"bold",
+			&Slack{},
+			args{
+				ie: slack.RichTextSectionElement(slack.NewRichTextSectionTextElement("New Message", &slack.RichTextSectionTextStyle{Bold: true})),
+			},
+			"<b>New Message</b>",
+			"",
+			false,
+		},
+		{
+			"italic",
+			&Slack{},
+			args{
+				ie: slack.RichTextSectionElement(slack.NewRichTextSectionTextElement("New Message", &slack.RichTextSectionTextStyle{Italic: true})),
+			},
+			"<i>New Message</i>",
+			"",
+			false,
+		},
+		{
+			"strike",
+			&Slack{},
+			args{
+				ie: slack.RichTextSectionElement(slack.NewRichTextSectionTextElement("New Message", &slack.RichTextSectionTextStyle{Strike: true})),
+			},
+			"<s>New Message</s>",
+			"",
+			false,
+		},
+		{
+			"code",
+			&Slack{},
+			args{
+				ie: slack.RichTextSectionElement(slack.NewRichTextSectionTextElement("Code message", &slack.RichTextSectionTextStyle{Code: true})),
+			},
+			"<code>Code message</code>",
+			"",
+			false,
+		},
+		{
+			"bold italic",
+			&Slack{},
+			args{
+				ie: slack.RichTextSectionElement(slack.NewRichTextSectionTextElement("New Message", &slack.RichTextSectionTextStyle{Bold: true, Italic: true})),
+			},
+			"<i><b>New Message</b></i>",
+			"",
+			false,
+		},
+		{
+			"marquee",
+			&Slack{},
+			args{
+				ie: slack.RichTextSectionElement(slack.NewRichTextSectionTextElement("Hello <MARQUEE> frenchesco's old\nfriend", nil)),
+			},
+			"Hello &lt;MARQUEE&gt; frenchesco&#39;s old<br>friend",
+			"",
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1, err := tt.s.rtseText(tt.args.ie)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("rtseText() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("rtseText() = %v, want %v", got, tt.want)
+			}
+			if got1 != tt.want1 {
+				t.Errorf("rtseText() = %v, want1 %v", got1, tt.want1)
+			}
+		})
+	}
+}
+
+func Test_rtseLink(t *testing.T) {
+	type args struct {
+		ie slack.RichTextSectionElement
+	}
+	tests := []struct {
+		name    string
+		s       *Slack
+		args    args
+		want    string
+		want1   string
+		wantErr bool
+	}{
+		{
+			"valid link",
+			&Slack{},
+			args{
+				ie: slack.RichTextSectionElement(slack.NewRichTextSectionLinkElement("https://example.com", "example.com", nil)),
+			},
+			"<a href=\"https://example.com\">example.com</a>",
+			"",
+			false,
+		},
+		{
+			"empty text",
+			&Slack{},
+			args{
+				ie: slack.RichTextSectionElement(slack.NewRichTextSectionLinkElement("https://example.com", "", nil)),
+			},
+			"<a href=\"https://example.com\">https://example.com</a>",
+			"",
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1, err := tt.s.rtseLink(tt.args.ie)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("rtseLink() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("rtseLink() = %v, want %v", got, tt.want)
+			}
+			if got1 != tt.want1 {
+				t.Errorf("rtseLink() = %v, want1 %v", got1, tt.want1)
+			}
+		})
+	}
+}
+
+func TestSlack_rtseUserGroup(t *testing.T) {
+	type args struct {
+		ie slack.RichTextSectionElement
+	}
+	tests := []struct {
+		name    string
+		s       *Slack
+		args    args
+		want    string
+		want1   string
+		wantErr bool
+	}{
+		{
+			"user group",
+			&Slack{},
+			args{
+				ie: slack.NewRichTextSectionUserGroupElement("W12345678"),
+			},
+			`<div class="slack-rich-text-section-user-group">&lt;@W12345678&gt;</div>`,
+			``,
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1, err := tt.s.rtseUserGroup(tt.args.ie)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Slack.rtseUserGroup() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("Slack.rtseUserGroup() = %v, want %v", got, tt.want)
+			}
+			if got1 != tt.want1 {
+				t.Errorf("Slack.rtseUserGroup() = %v, want1 %v", got1, tt.want1)
+			}
+		})
+	}
+}
+
+func TestSlack_rtseColor(t *testing.T) {
+	type args struct {
+		ie slack.RichTextSectionElement
+	}
+	tests := []struct {
+		name    string
+		s       *Slack
+		args    args
+		want    string
+		want1   string
+		wantErr bool
+	}{
+		{
+			"color block",
+			&Slack{},
+			args{
+				ie: slack.NewRichTextSectionColorElement("#ff0000"),
+			},
+			`<span style="color: #ff0000;">`,
+			`</span>`,
+			false,
+		},
+		{
+			"real",
+			&Slack{},
+			args{
+				ie: load[*slack.RichTextSectionColorElement](t, `{"type": "color","value": "#2475D9"}`),
+			},
+			`<span style="color: #2475D9;">`,
+			`</span>`,
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1, err := tt.s.rtseColor(tt.args.ie)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Slack.rtseColor() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("Slack.rtseColor() got = %v, want %v", got, tt.want)
+			}
+			if got1 != tt.want1 {
+				t.Errorf("Slack.rtseColor() got1 = %v, want %v", got1, tt.want1)
+			}
+		})
+	}
+}
+
+func TestSlack_rtseChannel(t *testing.T) {
+	cc := map[string]slack.Channel{
+		"C123": {GroupConversation: slack.GroupConversation{Conversation: slack.Conversation{ID: "C123"}, Name: "general"}},
+	}
+	tests := []struct {
+		name   string
+		s      *Slack
+		ie     slack.RichTextSectionElement
+		want   string
+		wantFn func(string) bool
+	}{
+		{
+			name: "no routes - plain div",
+			s:    &Slack{cc: cc},
+			ie:   slack.NewRichTextSectionChannelElement("C123", nil),
+			want: `<div class="slack-rich-text-section-channel">&lt;#general&gt;</div>`,
+		},
+		{
+			name: "live routes - linked",
+			s:    &Slack{cc: cc, routes: NewRoutes(ModeLive)},
+			ie:   slack.NewRichTextSectionChannelElement("C123", nil),
+			want: `<div class="slack-rich-text-section-channel"><a href="/archives/C123">&lt;#general&gt;</a></div>`,
+		},
+		{
+			name: "static routes - linked to index.html",
+			s:    &Slack{cc: cc, routes: NewRoutes(ModeStatic)},
+			ie:   slack.NewRichTextSectionChannelElement("C123", nil),
+			want: `<div class="slack-rich-text-section-channel"><a href="/archives/C123/index.html">&lt;#general&gt;</a></div>`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, _, err := tt.s.rtseChannel(tt.ie)
+			if err != nil {
+				t.Fatalf("rtseChannel() error = %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("rtseChannel() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSlack_rtseUser(t *testing.T) {
+	uu := map[string]slack.User{
+		"U123": {ID: "U123", Name: "alice"},
+	}
+	tests := []struct {
+		name string
+		s    *Slack
+		ie   slack.RichTextSectionElement
+		want string
+	}{
+		{
+			name: "no routes - plain mention",
+			s:    &Slack{uu: uu},
+			ie:   slack.NewRichTextSectionUserElement("U123", nil),
+			want: `&lt;@alice&gt;`,
+		},
+		{
+			name: "live routes - linked",
+			s:    &Slack{uu: uu, routes: NewRoutes(ModeLive)},
+			ie:   slack.NewRichTextSectionUserElement("U123", nil),
+			want: `<a href="/team/U123">&lt;@alice&gt;</a>`,
+		},
+		{
+			name: "static routes - linked to index.html",
+			s:    &Slack{uu: uu, routes: NewRoutes(ModeStatic)},
+			ie:   slack.NewRichTextSectionUserElement("U123", nil),
+			want: `<a href="/team/U123/index.html">&lt;@alice&gt;</a>`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, _, err := tt.s.rtseUser(tt.ie)
+			if err != nil {
+				t.Fatalf("rtseUser() error = %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("rtseUser() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMbtRichText(t *testing.T) {
+	const colorful = `{
+  "type": "rich_text",
+  "block_id": "arhEv",
+  "elements": [
+    {
+      "type": "rich_text_section",
+      "elements": [
+        {
+          "type": "color",
+          "value": "#2475D9"
+        },
+        {
+          "type": "text",
+          "text": ","
+        },
+        {
+          "type": "color",
+          "value": "#FC6215"
+        },
+        {
+          "type": "text",
+          "text": ","
+        },
+        {
+          "type": "color",
+          "value": "#FFFFFF"
+        },
+        {
+          "type": "text",
+          "text": ","
+        },
+        {
+          "type": "color",
+          "value": "#0A4B8C"
+        },
+        {
+          "type": "text",
+          "text": ","
+        },
+        {
+          "type": "color",
+          "value": "#FD8B24"
+        },
+        {
+          "type": "text",
+          "text": ","
+        },
+        {
+          "type": "color",
+          "value": "#FFFFFF"
+        },
+        {
+          "type": "text",
+          "text": ","
+        },
+        {
+          "type": "color",
+          "value": "#46BE6E"
+        },
+        {
+          "type": "text",
+          "text": ","
+        },
+        {
+          "type": "color",
+          "value": "#EE2436"
+        }
+      ]
+    }
+  ]
+}`
+	t.Run("colorful", func(t *testing.T) {
+		s := &Slack{}
+		m := load[*slack.RichTextBlock](t, colorful)
+		got, _, err := s.mbtRichText(m)
+		if err != nil {
+			t.Errorf("Slack.rtseSection() error = %v", err)
+			return
+		}
+		if got != `<span style="color: #2475D9;">,<span style="color: #FC6215;">,<span style="color: #FFFFFF;">,<span style="color: #0A4B8C;">,<span style="color: #FD8B24;">,<span style="color: #FFFFFF;">,<span style="color: #46BE6E;">,<span style="color: #EE2436;"></span></span></span></span></span></span></span></span>` {
+			t.Errorf("Slack.rtseSection() = %v", got)
+		}
+	})
+}

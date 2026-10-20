@@ -1,0 +1,97 @@
+package dedupe
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+
+	"github.com/jmoiron/sqlx"
+
+	"github.com/rusq/slackdump/v4/internal/chunk/backend/dbase/repository"
+)
+
+type Options struct {
+	Execute  bool
+	Report   io.Writer
+	Database string
+	Mode     repository.MessageDedupeMode
+}
+
+type Result struct {
+	Counts  repository.DedupeStats
+	Removed repository.DedupeStats
+}
+
+var newRepo = func(mode repository.MessageDedupeMode) repository.DedupeRepository {
+	return repository.NewDedupeRepository(repository.WithMessageDedupeMode(mode))
+}
+
+func Run(ctx context.Context, db *sqlx.DB, opts Options) (Result, error) {
+	repo := newRepo(opts.Mode)
+
+	counts, err := repo.Preview(ctx, db)
+	if err != nil {
+		return Result{}, fmt.Errorf("preview dedupe: %w", err)
+	}
+
+	slog.DebugContext(ctx, "dedupe preview",
+		"database", opts.Database,
+		"mode", opts.Mode.String(),
+		"duplicate_messages", counts.Messages,
+		"duplicate_canvas_messages", counts.CanvasMessages,
+		"duplicate_users", counts.Users,
+		"duplicate_channels", counts.Channels,
+		"duplicate_channel_users", counts.ChannelUsers,
+		"duplicate_files", counts.Files,
+		"prunable_chunks", counts.Chunks,
+	)
+
+	if opts.Report != nil {
+		fmt.Fprintf(opts.Report, "Duplicate messages: %d\n", counts.Messages)
+		fmt.Fprintf(opts.Report, "Duplicate canvas messages: %d\n", counts.CanvasMessages)
+		fmt.Fprintf(opts.Report, "Duplicate users: %d\n", counts.Users)
+		fmt.Fprintf(opts.Report, "Duplicate channels: %d\n", counts.Channels)
+		fmt.Fprintf(opts.Report, "Duplicate channel users: %d\n", counts.ChannelUsers)
+		fmt.Fprintf(opts.Report, "Duplicate files: %d\n", counts.Files)
+		fmt.Fprintf(opts.Report, "Chunks to prune: %d\n", counts.Chunks)
+	}
+
+	result := Result{Counts: counts}
+	if !opts.Execute {
+		if opts.Report != nil &&
+			(counts.Messages > 0 || counts.CanvasMessages > 0 || counts.Users > 0 || counts.Channels > 0 || counts.ChannelUsers > 0 || counts.Files > 0 || counts.Chunks > 0) {
+			fmt.Fprintln(opts.Report, "\nRun with -execute to perform dedupe.")
+		}
+		return result, nil
+	}
+
+	removed, err := repo.Deduplicate(ctx, db)
+	if err != nil {
+		return Result{}, fmt.Errorf("deduplicate entities: %w", err)
+	}
+	result.Removed = removed
+
+	slog.InfoContext(ctx, "dedupe execute",
+		"database", opts.Database,
+		"mode", opts.Mode.String(),
+		"removed_messages", removed.Messages,
+		"removed_canvas_messages", removed.CanvasMessages,
+		"removed_users", removed.Users,
+		"removed_channels", removed.Channels,
+		"removed_channel_users", removed.ChannelUsers,
+		"removed_files", removed.Files,
+		"removed_chunks", removed.Chunks,
+	)
+
+	if opts.Report != nil {
+		fmt.Fprintf(opts.Report, "\nRemoved messages: %d\n", removed.Messages)
+		fmt.Fprintf(opts.Report, "Removed canvas messages: %d\n", removed.CanvasMessages)
+		fmt.Fprintf(opts.Report, "Removed users: %d\n", removed.Users)
+		fmt.Fprintf(opts.Report, "Removed channels: %d\n", removed.Channels)
+		fmt.Fprintf(opts.Report, "Removed channel users: %d\n", removed.ChannelUsers)
+		fmt.Fprintf(opts.Report, "Removed files: %d\n", removed.Files)
+		fmt.Fprintf(opts.Report, "Removed chunks: %d\n", removed.Chunks)
+	}
+	return result, nil
+}

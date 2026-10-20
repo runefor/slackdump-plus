@@ -1,0 +1,298 @@
+// Copyright (c) 2021-2026 Rustam Gilyazov and Contributors.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package auth_ui
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/huh"
+	"github.com/rusq/osenv/v2"
+	"github.com/rusq/slackauth"
+
+	"github.com/rusq/slackdump/v4/internal/structures"
+)
+
+const (
+	defQRCodeSz = 16536     // default limit for encoded image size, seen values 6174, 8462
+	maxQRCodeSz = 1<<16 - 1 // maximum allowed QR code image size.
+	imgPrefix   = "data:image/png;base64,"
+)
+
+// limQRCodeSz is the size of the input field for QR Code image.
+var limQRCodeSz = osenv.Value("QR_CODE_SIZE", defQRCodeSz)
+
+// Huh is the Auth UI that uses the huh library to provide a terminal UI.
+type Huh struct{}
+
+var Theme = huh.ThemeBase16()
+
+func (h *Huh) RequestWorkspace(w io.Writer) (string, error) {
+	var workspace string
+	err := huh.NewForm(huh.NewGroup(
+		huh.NewInput().
+			Title("Enter Slack workspace name").
+			Value(&workspace).
+			Validate(valWorkspace).
+			Description("The workspace name is the part of the URL that comes before `.slack.com' in\nhttps://<workspace>.slack.com/.  Both workspace name or URL are acceptable."),
+	)).WithTheme(Theme).WithKeyMap(keymap).Run()
+	if err != nil {
+		return "", err
+	}
+	return workspace, nil
+}
+
+func (*Huh) Stop() {}
+
+func (*Huh) RequestCreds(ctx context.Context, w io.Writer, workspace string) (email string, passwd string, err error) {
+	f := huh.NewForm(
+		huh.NewGroup(
+			huh.NewInput().
+				Title("You Slack Login Email").Value(&email).
+				Placeholder("you@work.com").
+				Description(fmt.Sprintf("This is the email that you log into %s with.", workspace)).
+				Validate(valAND(valEmail, valRequired)),
+			huh.NewInput().
+				Title("Password").Value(&passwd).
+				Placeholder("your slack password").
+				Validate(valRequired).EchoMode(huh.EchoModePassword),
+		),
+	).WithTheme(Theme).WithKeyMap(keymap)
+	err = f.RunWithContext(ctx)
+	return
+}
+
+type methodMenuItem struct {
+	MenuItem  string
+	ShortDesc string
+	Type      LoginType
+}
+
+func (m methodMenuItem) String() string {
+	return fmt.Sprintf("%-20s - %s", m.MenuItem, m.ShortDesc)
+}
+
+var gMethods = []methodMenuItem{
+	{
+		"Interactive",
+		"Works with most authentication schemes, except Google.",
+		LInteractive,
+	},
+	{
+		"Automatic",
+		"Only suitable for email/password auth.",
+		LHeadless,
+	},
+	{
+		"User Browser",
+		"Loads your user profile, works with Google Auth.",
+		LUserBrowser,
+	},
+	{
+		"QR Code",
+		"Login using Sign in on Mobile QR code, works with Google Auth.",
+		LMobileSignin,
+	},
+}
+
+type LoginOpts struct {
+	Workspace   string
+	Type        LoginType
+	BrowserPath string
+}
+
+var keymap = huh.NewDefaultKeyMap()
+
+func init() {
+	keymap.Quit = key.NewBinding(key.WithKeys("esc", "ctrl+c"), key.WithHelp("esc", "Quit"))
+}
+
+func (*Huh) RequestLoginType(ctx context.Context, _ io.Writer, workspace string) (LoginOpts, error) {
+	ret := LoginOpts{
+		Workspace:   workspace,
+		Type:        LInteractive,
+		BrowserPath: "",
+	}
+
+	opts := make([]huh.Option[LoginType], 0, len(gMethods))
+	for _, m := range gMethods {
+		opts = append(opts, huh.NewOption(m.String(), m.Type))
+	}
+	opts = append(opts,
+		huh.NewOption("------", LoginType(-1)),
+		huh.NewOption("Cancel", LCancel),
+	)
+	var fields []huh.Field
+	if workspace == "" {
+		fields = append(fields, huh.NewInput().
+			Title("Enter Slack workspace name").
+			Value(&ret.Workspace).
+			Validate(valWorkspace).
+			Description("The workspace name is the part of the URL that comes before `.slack.com' in\nhttps://<workspace>.slack.com/.  Both workspace name or URL are acceptable."),
+		)
+	}
+
+	fields = append(fields, huh.NewSelect[LoginType]().
+		TitleFunc(func() string {
+			wsp, err := structures.ExtractWorkspace(ret.Workspace)
+			if err != nil {
+				return "Select login type"
+			}
+			return fmt.Sprintf("Select login type for [%s]", wsp)
+		}, &ret.Workspace).
+		Options(opts...).
+		Value(&ret.Type).
+		Validate(valSepEaster()).
+		DescriptionFunc(func() string {
+			switch ret.Type {
+			case LInteractive:
+				return "Clean browser will open on a Slack Login page."
+			case LHeadless:
+				return "You will be prompted to enter your email and password, login is automated."
+			case LUserBrowser:
+				return "System browser will open on a Slack Login page."
+			case LMobileSignin:
+				return "Sign in using 'Sign in on Mobile' QR code."
+			case LCancel:
+				return "Cancel the login process."
+			default:
+				return ""
+			}
+		}, &ret.Type))
+
+	form := huh.NewForm(huh.NewGroup(fields...)).WithTheme(Theme).WithKeyMap(keymap)
+
+	if err := form.RunWithContext(ctx); err != nil {
+		return ret, err
+	}
+	var err error
+	ret.Workspace, err = structures.ExtractWorkspace(ret.Workspace)
+	if err != nil {
+		return ret, err
+	}
+
+	if ret.Type == LUserBrowser {
+		path, err := chooseBrowser(ctx)
+		if err != nil {
+			return ret, err
+		}
+		ret.BrowserPath = path
+		return ret, err
+	}
+
+	return ret, nil
+}
+
+func chooseBrowser(ctx context.Context) (string, error) {
+	browsers, err := slackauth.ListBrowsers()
+	if err != nil {
+		return "", err
+	}
+	opts := make([]huh.Option[int], 0, len(browsers))
+	for i, b := range browsers {
+		opts = append(opts, huh.NewOption(b.Name, i))
+	}
+
+	var selection int
+	err = huh.NewForm(huh.NewGroup(
+		huh.NewSelect[int]().
+			Title("Detected browsers on your system").
+			Options(opts...).
+			Value(&selection).
+			DescriptionFunc(func() string {
+				return browsers[selection].Path
+			}, &selection),
+	)).WithTheme(Theme).WithKeyMap(keymap).RunWithContext(ctx)
+	if err != nil {
+		return "", err
+	}
+	return browsers[selection].Path, nil
+}
+
+// ConfirmationCode asks the user to input the confirmation code, does some
+// validation on it and returns it as an int.
+func (*Huh) ConfirmationCode(email string) (int, error) {
+	var strCode string
+	q := huh.NewForm(huh.NewGroup(
+		huh.NewInput().
+			CharLimit(6).
+			Placeholder("00000").
+			Title(fmt.Sprintf("Enter confirmation code sent to %s", email)).
+			Description("Slack did not recognise the browser, and sent a confirmation code.  Please enter the confirmation code below.").
+			Value(&strCode).
+			Validate(valSixDigits),
+	)).WithTheme(Theme)
+	if err := q.Run(); err != nil {
+		return 0, err
+	}
+	code, err := strconv.Atoi(strCode)
+	if err != nil {
+		return 0, err
+	}
+	return code, nil
+}
+
+var numChlgRE = regexp.MustCompile(`^\d{6}$`)
+
+func valSixDigits(s string) error {
+	if !numChlgRE.MatchString(s) {
+		return errors.New("confirmation code must be a sequence of six digits")
+	}
+	return nil
+}
+
+func (*Huh) RequestQR(ctx context.Context, _ io.Writer) (string, error) {
+	const description = `In a logged-in Slack desktop app or web client:
+  1. click your workspace name (not logo) in the upper left corner;
+  2. choose 'Sign in on mobile';
+  3. right-click the QR code image;
+  4. choose 'Copy Image URL'.`
+
+	var imageData string
+	q := huh.NewForm(huh.NewGroup(
+		huh.NewText().
+			CharLimit(qrCharLimit()).
+			Value(&imageData).
+			Validate(func(s string) error {
+				if !strings.HasPrefix(s, imgPrefix) {
+					return errors.New("image data must start with " + imgPrefix)
+				}
+				return nil
+			}).
+			Placeholder(imgPrefix + "...").
+			Title("Paste QR code image data into this field").
+			Description(description),
+	))
+	if err := q.Run(); err != nil {
+		return "", err
+	}
+	return imageData, nil
+}
+
+// qrCharLimit returns the effective character limit for the QR code input
+// field.
+func qrCharLimit() int {
+	if defQRCodeSz <= limQRCodeSz && limQRCodeSz <= maxQRCodeSz {
+		return limQRCodeSz
+	}
+	return defQRCodeSz
+}

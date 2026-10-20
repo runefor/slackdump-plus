@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "slackdump": {
+      "type": "stdio",
+      "command": "slackdump",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}

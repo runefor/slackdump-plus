@@ -1,0 +1,189 @@
+// Copyright (c) 2021-2026 Rustam Gilyazov and Contributors.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package diag
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"os"
+
+	"github.com/rusq/slackdump/v4/auth"
+	"github.com/rusq/slackdump/v4/cmd/slackdump/internal/cfg"
+	"github.com/rusq/slackdump/v4/cmd/slackdump/internal/golang/base"
+	"github.com/rusq/slackdump/v4/internal/edge"
+)
+
+var cmdEdge = &base.Command{
+	Run:         runEdge,
+	UsageLine:   "slack tools edge",
+	Short:       "Edge test",
+	RequireAuth: true,
+	HideWizard:  true,
+	Long: `
+# Slack Edge API test tool
+
+Edge test attempts to call the Edge API with the provided credentials.
+
+Not particularly useful for end users, but can be used to test the Edge API.
+`,
+}
+
+var edgeParams = struct {
+	channel      string
+	canvasFileID string
+}{}
+
+func init() {
+	cmdEdge.Flag.StringVar(&edgeParams.channel, "channel", "CHY5HUESG", "channel to get users from")
+	cmdEdge.Flag.StringVar(&edgeParams.canvasFileID, "canvas-file", "", "canvas file ID (triggers canvas thread test)")
+}
+
+func runEdge(ctx context.Context, cmd *base.Command, args []string) error {
+	lg := cfg.Log
+
+	prov, err := auth.FromContext(ctx)
+	if err != nil {
+		base.SetExitStatus(base.SAuthError)
+		return err
+	}
+
+	info, err := prov.Test(ctx)
+	if err != nil {
+		base.SetExitStatus(base.SAuthError)
+		return err
+	}
+
+	cl, err := edge.NewWithInfo(info, prov)
+	if err != nil {
+		base.SetExitStatus(base.SApplicationError)
+		return err
+	}
+	defer cl.Close()
+	lg.Info("connected", "user", info.UserID)
+
+	if edgeParams.canvasFileID != "" {
+		lg.Info("*** CanvasThreadRoots test ***", "file", edgeParams.canvasFileID)
+		msgs, err := cl.CanvasThreadRoots(ctx, edgeParams.canvasFileID)
+		if err != nil {
+			return fmt.Errorf("CanvasThreadRoots: %w", err)
+		}
+		lg.Info("got canvas thread roots", "count", len(msgs))
+		return save("canvas_threads.json", msgs)
+	}
+
+	// lg.Info("*** Search for Channels test ***")
+	// channels, err := cl.SearchChannels(ctx, "")
+	// if err != nil {
+	// 	return err
+	// }
+	// if err := save("channels.json", channels); err != nil {
+	// 	return err
+	// }
+
+	lg.Info("*** AdminEmojiList test ***")
+	var allEmoji edge.EmojiResult
+
+	iter := 0
+	for res, err := range cl.AdminEmojiList(ctx) {
+		if err != nil {
+			return err
+		}
+		slog.Info("got emojis", "count", len(res.Emoji), "disabled", len(res.DisabledEmoji), "iter", iter)
+		iter++
+		allEmoji.Emoji = append(allEmoji.Emoji, res.Emoji...)
+		allEmoji.DisabledEmoji = append(allEmoji.DisabledEmoji, res.DisabledEmoji...)
+	}
+
+	if err := save("emoji.json", allEmoji); err != nil {
+		return err
+	}
+
+	// lg.Printf("*** IMs test ***")
+	// ims, err := cl.IMList(ctx)
+	// if err != nil {
+	// 	return err
+	// }
+	// if err := save("ims.json", ims); err != nil {
+	// 	return err
+	// }
+
+	// lg.Printf("*** Counts ***")
+	// counts, err := cl.ClientCounts(ctx)
+	// if err != nil {
+	// 	return err
+	// }
+	// if err := save("counts.json", counts); err != nil {
+	// 	return err
+	// }
+
+	// lg.Print("*** GetConversationsContext ***")
+	// gcc, _, err := cl.GetConversationsContext(ctx, nil)
+	// if err != nil {
+	// 	return err
+	// }
+	// if err := save("get_conversations_context.json", gcc); err != nil {
+	// 	return err
+	// }
+
+	// lg.Print("*** GetUsersInConversationContext ***")
+	// if len(gcc) > 0 {
+	// 	lg.Printf("using: %s", gcc[0].Name)
+	// 	guic, _, err := cl.GetUsersInConversationContext(ctx, &slack.GetUsersInConversationParameters{ChannelID: gcc[0].ID})
+	// 	if err != nil {
+	// 		return err
+	// 	}
+	// 	if err := save("get_users_in_conversation_context.json", guic); err != nil {
+	// 		return err
+	// 	}
+	// 	if len(guic) > 0 {
+	// 		lg.Print("*** GetUsers ***")
+	// 		users, err := cl.GetUsers(ctx, guic...)
+	// 		if err != nil {
+	// 			return err
+	// 		}
+	// 		if err := save("get_users.json", users); err != nil {
+	// 			return err
+	// 		}
+	// 	}
+	// 	lg.Print("*** Conversations Generic Info ***")
+	// 	ci, err := cl.ConversationsGenericInfo(ctx, gcc[0].ID)
+	// 	if err != nil {
+	// 		return err
+	// 	}
+	// 	if err := save("conversations_generic_info.json", ci); err != nil {
+	// 		return err
+	// 	}
+	// }
+
+	lg.Info("OK")
+	return nil
+}
+
+func save(filename string, r any) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(r); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}

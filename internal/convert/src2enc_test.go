@@ -1,0 +1,397 @@
+// Copyright (c) 2021-2026 Rustam Gilyazov and Contributors.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package convert
+
+import (
+	"context"
+	"fmt"
+	"iter"
+	"log/slog"
+	"path/filepath"
+	"slices"
+	"testing"
+	"testing/fstest"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+	"github.com/rusq/fsadapter"
+	"github.com/rusq/slackdump/v4/source/mock_source"
+
+	"github.com/rusq/slack"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+	_ "modernc.org/sqlite"
+
+	"github.com/rusq/slackdump/v4/internal/chunk"
+	"github.com/rusq/slackdump/v4/internal/chunk/backend/dbase"
+	"github.com/rusq/slackdump/v4/internal/chunk/backend/dbase/repository"
+	"github.com/rusq/slackdump/v4/internal/chunk/backend/directory"
+	"github.com/rusq/slackdump/v4/internal/fasttime"
+	"github.com/rusq/slackdump/v4/internal/structures"
+	"github.com/rusq/slackdump/v4/mocks/mock_processor"
+	"github.com/rusq/slackdump/v4/processor"
+	"github.com/rusq/slackdump/v4/source"
+)
+
+func Test_encodeMessages(t *testing.T) {
+	type args struct {
+		ctx context.Context
+		// rec processor.Conversations
+		// src source.Sourcer
+		ch *slack.Channel
+	}
+	tests := []struct {
+		name     string
+		args     args
+		expectFn func(t *testing.T, mc *mock_processor.MockConversations, ms *mock_source.MockSourcer)
+		wantErr  bool
+	}{
+		{
+			name: "ok",
+			args: args{
+				ctx: t.Context(),
+				ch:  structures.ChannelFromID("C123"),
+			},
+			expectFn: func(t *testing.T, mc *mock_processor.MockConversations, ms *mock_source.MockSourcer) {
+				it, msgs := msgGenerator(t, time.Now().UnixMicro(), 203, defaultChunkSize)
+				ms.EXPECT().AllMessages(gomock.Any(), "C123").Return(it, nil)
+				for i := range len(msgs) - 1 { // this should be called 203/100=2 times
+					mc.EXPECT().Messages(gomock.Any(), "C123", 0, false, msgs[i]).Return(nil)
+				}
+				// last flush call, called with the 3 message chunk
+				mc.EXPECT().Messages(gomock.Any(), "C123", 0, true, msgs[len(msgs)-1]).Return(nil)
+			},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mc := mock_processor.NewMockConversations(ctrl)
+			ms := mock_source.NewMockSourcer(ctrl)
+			if tt.expectFn != nil {
+				tt.expectFn(t, mc, ms)
+			}
+			if err := encodeMessages(tt.args.ctx, mc, ms, tt.args.ch); (err != nil) != tt.wantErr {
+				t.Errorf("encodeMessages() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+
+	t.Run("skipped file modes do not fail source encoding file copy", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		mc := mock_processor.NewMockConversations(ctrl)
+		ms := mock_source.NewMockSourcer(ctrl)
+		st := mock_source.NewMockStorage(ctrl)
+
+		msg := slack.Message{
+			Msg: slack.Msg{
+				Timestamp: "123.456",
+				Text:      "msg",
+				Files: []slack.File{{
+					ID:   "F1",
+					Name: "gone.txt",
+					Mode: "tombstone",
+				}},
+			},
+		}
+		it := func(yield func(slack.Message, error) bool) {
+			yield(msg, nil)
+		}
+
+		ms.EXPECT().AllMessages(gomock.Any(), "C123").Return(it, nil)
+		ms.EXPECT().Files().Return(st).Times(1)
+		st.EXPECT().FS().Return(fstest.MapFS{}).Times(1)
+		mc.EXPECT().Files(gomock.Any(), gomock.Any(), msg, msg.Files).Return(nil)
+		mc.EXPECT().Messages(gomock.Any(), "C123", 0, true, []slack.Message{msg}).Return(nil)
+
+		rec := processor.PrependFiler(mc, &filecopywrapper{
+			fc: NewFileCopier(ms, fsadapter.NewDirectory(t.TempDir()), source.MattermostFilepath, true),
+		})
+		if err := encodeMessages(t.Context(), rec, ms, structures.ChannelFromID("C123")); err != nil {
+			t.Fatalf("encodeMessages() error = %v, want nil", err)
+		}
+	})
+}
+
+func msgGenerator(t *testing.T, startTS int64, num int, chunkSz int) (iter.Seq2[slack.Message, error], [][]slack.Message) {
+	// generating messages
+	msg := make([]slack.Message, num)
+	for i := range num {
+		ts := fasttime.Int2TS(startTS + int64(i))
+		m := slack.Message{
+			Msg: slack.Msg{
+				Timestamp: ts,
+				Text:      "msg: " + ts,
+			},
+		}
+		msg[i] = m
+	}
+	msgs := slices.Collect(slices.Chunk(msg, chunkSz))
+	// creating iterator
+	it := func(yield func(slack.Message, error) bool) {
+		for _, m := range msg {
+			if !yield(m, nil) {
+				break
+			}
+		}
+	}
+	return it, msgs
+}
+
+func threadGenerator(t *testing.T, parentTS string, num int, chunkSz int) (iter.Seq2[slack.Message, error], [][]slack.Message) {
+	start, err := fasttime.TS2int(parentTS)
+	if err != nil {
+		t.Fatalf("failed to convert timestamp: %v", err)
+	}
+	// generating messages
+	msg := make([]slack.Message, num)
+	for i := range num {
+		ts := fasttime.Int2TS(start + int64(i))
+		m := slack.Message{
+			Msg: slack.Msg{
+				Timestamp:       ts,
+				Text:            "thread msg: " + ts,
+				ThreadTimestamp: parentTS,
+			},
+		}
+		msg[i] = m
+	}
+	msgs := slices.Collect(slices.Chunk(msg, chunkSz))
+	// creating iterator
+	it := func(yield func(slack.Message, error) bool) {
+		for _, m := range msg {
+			if !yield(m, nil) {
+				break
+			}
+		}
+	}
+	return it, msgs
+}
+
+func Test_encodeThreadMessages(t *testing.T) {
+	parentMsg := &slack.Message{Msg: slack.Msg{Timestamp: "123.456", ThreadTimestamp: "123.456"}}
+	type args struct {
+		ctx context.Context
+		// rec      processor.Conversations
+		// src      source.Sourcer
+		ch       *slack.Channel
+		par      *slack.Message
+		threadTS string
+	}
+	tests := []struct {
+		name     string
+		args     args
+		expectFn func(t *testing.T, mc *mock_processor.MockConversations, ms *mock_source.MockSourcer)
+		wantErr  bool
+	}{
+		{
+			name: "ok",
+			args: args{
+				ctx:      t.Context(),
+				ch:       structures.ChannelFromID("C123"),
+				par:      parentMsg,
+				threadTS: "123.456",
+			},
+			expectFn: func(t *testing.T, mc *mock_processor.MockConversations, ms *mock_source.MockSourcer) {
+				it, msgs := threadGenerator(t, "123.456", 203, defaultChunkSize)
+				ms.EXPECT().AllThreadMessages(gomock.Any(), "C123", "123.456").Return(it, nil)
+				for i := range len(msgs) - 1 { // this should be called 203/100=2 times
+					mc.EXPECT().ThreadMessages(gomock.Any(), "C123", *parentMsg, false, false, msgs[i]).Return(nil)
+				}
+				// last flush call, called with the 3 message chunk
+				mc.EXPECT().ThreadMessages(gomock.Any(), "C123", *parentMsg, false, true, msgs[len(msgs)-1]).Return(nil)
+			},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mc := mock_processor.NewMockConversations(ctrl)
+			ms := mock_source.NewMockSourcer(ctrl)
+			if tt.expectFn != nil {
+				tt.expectFn(t, mc, ms)
+			}
+			if err := encodeThreadMessages(tt.args.ctx, mc, ms, tt.args.ch, tt.args.par, tt.args.threadTS); (err != nil) != tt.wantErr {
+				t.Errorf("encodeThreadMessages() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+type canvasTestSource struct {
+	roots   []slack.Message
+	threads map[string][]slack.Message
+}
+
+func (s canvasTestSource) CanvasMessages(context.Context, string) (iter.Seq2[slack.Message, error], error) {
+	return canvasMessageSeq(s.roots), nil
+}
+
+func (s canvasTestSource) CanvasThreadMessages(_ context.Context, _ string, threadTS string) (iter.Seq2[slack.Message, error], error) {
+	return canvasMessageSeq(s.threads[threadTS]), nil
+}
+
+func canvasMessageSeq(messages []slack.Message) iter.Seq2[slack.Message, error] {
+	return func(yield func(slack.Message, error) bool) {
+		for _, m := range messages {
+			if !yield(m, nil) {
+				return
+			}
+		}
+	}
+}
+
+func Test_encodeCanvasMessages(t *testing.T) {
+	owner := structures.ChannelFromID("COWNER")
+	t.Run("root before discussion", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		rec := mock_processor.NewMockConversations(ctrl)
+		cm := mock_processor.NewMockCanvasMessenger(ctrl)
+		root := slack.Message{Msg: slack.Msg{
+			Timestamp:  "123.456",
+			ReplyCount: 1,
+			Text:       "root",
+		}}
+		reply := slack.Message{Msg: slack.Msg{
+			Timestamp:       "124.456",
+			ThreadTimestamp: root.Timestamp,
+			Text:            "reply",
+		}}
+		normalisedRoot := root
+		normalisedRoot.ThreadTimestamp = root.Timestamp
+		src := canvasTestSource{
+			roots: []slack.Message{root},
+			threads: map[string][]slack.Message{
+				root.Timestamp: {normalisedRoot, reply},
+			},
+		}
+		gomock.InOrder(
+			cm.EXPECT().CanvasMessages(gomock.Any(), "CCANVAS", 1, true, []slack.Message{normalisedRoot}).Return(nil),
+			cm.EXPECT().CanvasThreadMessages(gomock.Any(), "CCANVAS", normalisedRoot, true, []slack.Message{normalisedRoot, reply}).Return(nil),
+		)
+
+		require.NoError(t, encodeCanvasMessages(t.Context(), rec, cm, src, owner, "CCANVAS"))
+	})
+
+	for _, tt := range []struct {
+		name    string
+		roots   int
+		replies int
+	}{
+		{"multiple discussions", 2, 1},
+		{"multiple root and reply pages", defaultChunkSize + 1, defaultChunkSize + 1},
+		{"empty discussions", 2, 0},
+		{"no roots", 0, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			src := canvasTestSource{threads: make(map[string][]slack.Message)}
+			for i := range tt.roots {
+				root := slack.Message{Msg: slack.Msg{
+					Timestamp:  fmt.Sprintf("%d.000001", 1700000000+i),
+					ReplyCount: 1,
+				}}
+				src.roots = append(src.roots, root)
+				for j := range tt.replies {
+					src.threads[root.Timestamp] = append(src.threads[root.Timestamp], slack.Message{Msg: slack.Msg{
+						Timestamp:       fmt.Sprintf("%d.%06d", 1800000000+i, j+1),
+						ThreadTimestamp: root.Timestamp,
+						Text:            "reply",
+					}})
+				}
+			}
+			cd, err := chunk.CreateDir(t.TempDir())
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, cd.Close()) })
+			enc := directory.NewERC(cd, slog.Default())
+			t.Cleanup(func() { require.NoError(t, enc.Close()) })
+			recorder := chunk.NewCustomRecorder(enc)
+			require.NoError(t, encodeCanvasMessages(t.Context(), recorder, recorder, src, owner, "CCANVAS"))
+			got, err := cd.CanvasMessages(t.Context(), "CCANVAS")
+			require.NoError(t, err)
+			require.Len(t, got, tt.roots)
+			for _, root := range src.roots {
+				got, err := cd.CanvasThreadMessages(t.Context(), "CCANVAS", root.Timestamp)
+				require.NoError(t, err)
+				// The directory source returns the parent alongside replies.
+				require.Len(t, got, tt.replies+1)
+			}
+		})
+	}
+}
+
+// canvasCheckEncoder checks reassembled chunks before forwarding them to ERC.
+type canvasCheckEncoder func(context.Context, *chunk.Chunk) error
+
+func (f canvasCheckEncoder) Encode(ctx context.Context, c *chunk.Chunk) error {
+	return f(ctx, c)
+}
+
+func Test_encodeCanvasThreadMessages(t *testing.T) {
+	for _, count := range []int{0, defaultChunkSize, 2 * defaultChunkSize, defaultChunkSize + 1} {
+		t.Run(fmt.Sprintf("database round trip %d messages", count), func(t *testing.T) {
+			parent := slack.Message{Msg: slack.Msg{Timestamp: "1700000000.000001", ThreadTimestamp: "1700000000.000001", ReplyCount: max(1, count), Text: "parent"}}
+			messages := make([]slack.Message, 0, count)
+			for i := range count {
+				messages = append(messages, slack.Message{Msg: slack.Msg{Timestamp: fmt.Sprintf("1800000000.%06d", i+1), ThreadTimestamp: parent.Timestamp, Text: "reply"}})
+			}
+			src := canvasTestSource{threads: map[string][]slack.Message{parent.Timestamp: messages}}
+			dbpath := filepath.Join(t.TempDir(), "slackdump.sqlite")
+			conn, err := sqlx.Open(repository.Driver, dbpath)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = conn.Close() })
+			db, err := dbase.New(t.Context(), conn, dbase.SessionInfo{})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, db.Close()) })
+			rec := chunk.NewCustomRecorder(db)
+			require.NoError(t, rec.CanvasMessages(t.Context(), "CCANVAS", 1, true, []slack.Message{parent}))
+			found, err := encodeCanvasThreadMessages(t.Context(), rec, rec, src, structures.ChannelFromID("COWNER"), "CCANVAS", &parent)
+			require.NoError(t, err)
+			require.Equal(t, count > 0, found)
+			require.NoError(t, db.Finish())
+			require.NoError(t, conn.Close())
+			loaded, err := dbase.Open(t.Context(), dbpath)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, loaded.Close()) })
+			cd, err := chunk.CreateDir(t.TempDir())
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, cd.Close()) })
+			enc := directory.NewERC(cd, slog.Default())
+			t.Cleanup(func() { require.NoError(t, enc.Close()) })
+			finals := 0
+			check := canvasCheckEncoder(func(ctx context.Context, c *chunk.Chunk) error {
+				if c.Type == chunk.CCanvasThreadMessages {
+					require.NotNil(t, c.Parent)
+					require.Equal(t, parent, *c.Parent)
+					require.Equal(t, parent.Timestamp, c.ThreadTS)
+					if c.IsLast {
+						finals++
+					}
+				}
+				return enc.Encode(ctx, c)
+			})
+			require.NoError(t, loaded.ToChunk(t.Context(), check, 1))
+			require.Equal(t, 1, finals)
+			roots, err := cd.CanvasMessages(t.Context(), "CCANVAS")
+			require.NoError(t, err)
+			require.Equal(t, []slack.Message{parent}, roots)
+			got, err := cd.CanvasThreadMessages(t.Context(), "CCANVAS", parent.Timestamp)
+			require.NoError(t, err)
+			require.Equal(t, append([]slack.Message{parent}, messages...), got)
+		})
+	}
+}

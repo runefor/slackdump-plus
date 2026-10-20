@@ -1,0 +1,46 @@
+// Copyright (c) 2021-2026 Rustam Gilyazov and Contributors.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package testutil
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+// MarshalJSON marshals data to JSON and returns the byte slice.
+func MarshalJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// RoundTripJSON marshals and unmarshals v, returning the decoded value.
+func RoundTripJSON[T any](t testing.TB, v T) T {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal JSON: %v", err)
+	}
+
+	var got T
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal JSON: %v", err)
+	}
+	return got
+}
